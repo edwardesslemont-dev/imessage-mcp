@@ -67,6 +67,8 @@ Add to the existing `mcpServers` block:
 
 Replace `/Users/YOU/` with your home directory; replace `Documents/Vault` with wherever your Obsidian vault lives.
 
+Optional: `IMESSAGE_BLOCKLIST` (default `~/.claude/imessage-mcp/blocklist.md`) lists people whose messages the server never returns. One entry per line, shaped `` - `+15555550123` label ``. Their 1:1 chat is hidden whole and their messages are dropped from groups, search, attachments and exports. The file may be a symlink; if it exists but cannot be read, every read fails rather than returning unfiltered data. `healthcheck` reports how many entries loaded.
+
 Validate: `python3 -c "import json; json.load(open('/path/to/vault/.mcp.json'))"` — must print nothing (no exception).
 
 Restart Claude Code. `claude mcp list` should show `imessage` connected.

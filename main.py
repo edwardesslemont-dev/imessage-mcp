@@ -162,6 +162,9 @@ def list_messages(
         "list_messages",
         {"chat_id": chat_id, "limit": limit, "before_rowid": before_rowid},
     ) as a:
+        if chatdb.is_blocked_chat(chat_id):
+            a.summary = "blocked"
+            return {"error": "chat is on the iMessage blocklist", "chat_id": chat_id}
         chat = chatdb.get_chat(chat_id)
         if not chat:
             a.summary = "chat not found"

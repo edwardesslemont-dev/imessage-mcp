@@ -14,8 +14,11 @@ import os
 import sqlite3
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, NoReturn
+
+import blocklist
 
 CHAT_DB = Path.home() / "Library" / "Messages" / "chat.db"
 
@@ -272,6 +275,92 @@ def message_text(row: sqlite3.Row | dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Blocklist (see blocklist.py)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Blocked:
+    """Rows belonging to blocklisted people, resolved against one connection.
+
+    A blocked person's 1:1 chat is hidden whole, both sides of it. In a group
+    chat only the messages they sent are dropped. In chat.db both directions of
+    a 1:1 chat carry the other person's handle_id, so `handle_rowids` alone
+    covers it; `chat_rowids` and `message_rowids` are there so the rule does
+    not depend on that.
+    """
+
+    handles: frozenset[str] = field(default_factory=frozenset)
+    handle_rowids: frozenset[int] = field(default_factory=frozenset)
+    chat_rowids: frozenset[int] = field(default_factory=frozenset)
+    message_rowids: frozenset[int] = field(default_factory=frozenset)
+
+    def __bool__(self) -> bool:
+        return bool(self.handle_rowids)
+
+    def drops(self, message_rowid: int, handle_id: int | None) -> bool:
+        return handle_id in self.handle_rowids or message_rowid in self.message_rowids
+
+
+def blocked_rows(conn: sqlite3.Connection) -> Blocked:
+    """Resolve the blocklist to chat.db ROWIDs. Raises BlocklistUnreadable."""
+    entries = blocklist.load()
+    if not entries:
+        return Blocked()
+    handles = {
+        (r["ROWID"], r["id"])
+        for r in conn.execute("SELECT ROWID, id FROM handle")
+        if blocklist.is_blocked(r["id"], entries)
+    }
+    if not handles:
+        return Blocked()
+    rowids = tuple(h[0] for h in handles)
+    marks = ",".join("?" * len(rowids))
+    chats = frozenset(
+        r[0]
+        for r in conn.execute(
+            f"SELECT c.ROWID FROM chat c JOIN chat_handle_join chj ON chj.chat_id = c.ROWID "
+            f"WHERE c.style = 45 AND chj.handle_id IN ({marks})",
+            rowids,
+        )
+    )
+    msgs: frozenset[int] = frozenset()
+    if chats:
+        cmarks = ",".join("?" * len(chats))
+        msgs = frozenset(
+            r[0]
+            for r in conn.execute(
+                f"SELECT message_id FROM chat_message_join WHERE chat_id IN ({cmarks})",
+                tuple(chats),
+            )
+        )
+    return Blocked(
+        handles=frozenset(h[1] for h in handles),
+        handle_rowids=frozenset(rowids),
+        chat_rowids=chats,
+        message_rowids=msgs,
+    )
+
+
+def _keep(rows: list[sqlite3.Row], b: Blocked) -> list[sqlite3.Row]:
+    if not b:
+        return rows
+    return [r for r in rows if r and not b.drops(r["ROWID"], r["handle_id"])]
+
+
+def is_blocked_chat(chat_id: int | str) -> bool:
+    """True when chat_id (ROWID or guid) is a blocked person's 1:1 chat."""
+    with open_db() as conn:
+        b = blocked_rows(conn)
+        if not b:
+            return False
+        if isinstance(chat_id, int) or (isinstance(chat_id, str) and chat_id.isdigit()):
+            return int(chat_id) in b.chat_rowids
+        row = conn.execute("SELECT ROWID FROM chat WHERE guid = ?", (chat_id,)).fetchone()
+        return bool(row) and row["ROWID"] in b.chat_rowids
+
+
+# ---------------------------------------------------------------------------
 # Public read APIs (used by main.py + export.py + search_index.py)
 # ---------------------------------------------------------------------------
 
@@ -287,11 +376,16 @@ def healthcheck() -> dict[str, Any]:
         "edit_count": 0,
         "reply_thread_count": 0,
         "stale_snapshot": False,
+        "blocklist_path": str(blocklist.BLOCKLIST_PATH),
+        "blocklist_entries": 0,
+        "blocklist_matched_handles": 0,
         "error": None,
     }
     try:
         with open_db() as conn:
             out["fda_granted"] = True
+            out["blocklist_entries"] = len(blocklist.load())
+            out["blocklist_matched_handles"] = len(blocked_rows(conn).handle_rowids)
             # Travels with the counts on purpose: an immutable open is frozen at
             # the last checkpoint, so a confident number here can still be wrong.
             out["stale_snapshot"] = reading_stale_snapshot()
@@ -306,7 +400,7 @@ def healthcheck() -> dict[str, Any]:
             out["reply_thread_count"] = conn.execute(
                 "SELECT COUNT(*) FROM message WHERE thread_originator_guid IS NOT NULL"
             ).fetchone()[0]
-    except FDADenied as e:
+    except (FDADenied, blocklist.BlocklistUnreadable) as e:
         out["error"] = str(e)
     except Exception as e:  # noqa: BLE001
         out["error"] = f"{type(e).__name__}: {e}"
@@ -365,6 +459,14 @@ def list_chats(
 
     chats: list[dict[str, Any]] = []
     with open_db() as conn:
+        b = blocked_rows(conn)
+        if b.chat_rowids:
+            marks = ",".join("?" * len(b.chat_rowids))
+            sql = sql.replace(
+                f"WHERE {' AND '.join(where)}",
+                f"WHERE {' AND '.join(where)} AND c.ROWID NOT IN ({marks})",
+            )
+            params[-1:-1] = list(b.chat_rowids)
         for row in conn.execute(sql, params):
             entry = {
                 "chat_rowid": row["chat_rowid"],
@@ -404,7 +506,7 @@ def get_chat(chat_id: int | str) -> dict[str, Any] | None:
             row = conn.execute("SELECT * FROM chat WHERE ROWID = ?", (int(chat_id),)).fetchone()
         else:
             row = conn.execute("SELECT * FROM chat WHERE guid = ?", (chat_id,)).fetchone()
-        if not row:
+        if not row or row["ROWID"] in blocked_rows(conn).chat_rowids:
             return None
         msg_count = conn.execute(
             "SELECT COUNT(*) FROM chat_message_join WHERE chat_id = ?", (row["ROWID"],)
@@ -457,11 +559,11 @@ def list_messages(
     sql += " ORDER BY m.date DESC, m.ROWID DESC LIMIT ?"
     params.append(limit)
 
-    out: list[dict[str, Any]] = []
     with open_db() as conn:
-        for row in conn.execute(sql, params):
-            out.append(_msg_row_to_dict(row))
-    return out
+        b = blocked_rows(conn)
+        if int(chat_id) in b.chat_rowids:
+            return []
+        return [_msg_row_to_dict(row) for row in _keep(list(conn.execute(sql, params)), b)]
 
 
 def list_messages_chronological(chat_id: int) -> list[dict[str, Any]]:
@@ -484,7 +586,10 @@ def list_messages_chronological(chat_id: int) -> list[dict[str, Any]]:
         ORDER BY m.date ASC, m.ROWID ASC
     """
     with open_db() as conn:
-        return [_msg_row_to_dict(r) for r in conn.execute(sql, (chat_id,))]
+        b = blocked_rows(conn)
+        if int(chat_id) in b.chat_rowids:
+            return []
+        return [_msg_row_to_dict(r) for r in _keep(list(conn.execute(sql, (chat_id,))), b)]
 
 
 def get_message_context(rowid: int, before: int = 5, after: int = 5) -> list[dict[str, Any]]:
@@ -496,6 +601,9 @@ def get_message_context(rowid: int, before: int = 5, after: int = 5) -> list[dic
         if not chat:
             return []
         chat_id = chat["chat_id"]
+        b = blocked_rows(conn)
+        if chat_id in b.chat_rowids:
+            return []
 
         before_rows = list(
             conn.execute(
@@ -553,8 +661,10 @@ def get_message_context(rowid: int, before: int = 5, after: int = 5) -> list[dic
             )
         )
 
+    if center_row and b.drops(center_row["ROWID"], center_row["handle_id"]):
+        return []
     rows = list(reversed(before_rows)) + ([center_row] if center_row else []) + after_rows
-    return [_msg_row_to_dict(r) for r in rows if r]
+    return [_msg_row_to_dict(r) for r in _keep(rows, b)]
 
 
 def get_unread(limit: int = 50) -> list[dict[str, Any]]:
@@ -584,7 +694,7 @@ def get_unread(limit: int = 50) -> list[dict[str, Any]]:
     """
     with open_db() as conn:
         out = []
-        for row in conn.execute(sql, (limit,)):
+        for row in _keep(list(conn.execute(sql, (limit,))), blocked_rows(conn)):
             d = _msg_row_to_dict(row)
             d["chat_id"] = row["chat_id"]
             out.append(d)
@@ -610,7 +720,8 @@ def get_thread(originator_guid: str) -> list[dict[str, Any]]:
         ORDER BY m.date ASC
     """
     with open_db() as conn:
-        return [_msg_row_to_dict(r) for r in conn.execute(sql, (originator_guid, originator_guid))]
+        rows = list(conn.execute(sql, (originator_guid, originator_guid)))
+        return [_msg_row_to_dict(r) for r in _keep(rows, blocked_rows(conn))]
 
 
 def list_attachments(
@@ -644,6 +755,18 @@ def list_attachments(
     """
     params.append(limit)
     with open_db() as conn:
+        b = blocked_rows(conn)
+        if b:
+            ids = tuple(b.handle_rowids) + tuple(b.message_rowids)
+            hm = ",".join("?" * len(b.handle_rowids))
+            mm = ",".join("?" * len(b.message_rowids)) or "NULL"
+            sql = sql.replace(
+                f"WHERE {' AND '.join(where)}",
+                f"WHERE {' AND '.join(where)} AND NOT EXISTS (SELECT 1 FROM message_attachment_join maj3 "
+                f"JOIN message m3 ON m3.ROWID = maj3.message_id WHERE maj3.attachment_id = a.ROWID "
+                f"AND (m3.handle_id IN ({hm}) OR m3.ROWID IN ({mm})))",
+            )
+            params[-1:-1] = list(ids)
         return [
             {
                 "rowid": r["ROWID"],
@@ -731,6 +854,7 @@ def search_contacts_by_handle(
         LIMIT ?
     """
     with open_db() as conn:
+        b = blocked_rows(conn)
         return [
             {
                 "handle_rowid": r["ROWID"],
@@ -741,6 +865,7 @@ def search_contacts_by_handle(
                 "is_email": "@" in (r["id"] or ""),
             }
             for r in conn.execute(sql, (q, limit))
+            if r["ROWID"] not in b.handle_rowids
         ]
 
 

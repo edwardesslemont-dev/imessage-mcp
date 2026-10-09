@@ -78,6 +78,17 @@ def refresh_index(full_rebuild: bool = False) -> dict[str, Any]:
             idx.execute("DELETE FROM index_state")
             idx.commit()
 
+        # Blocked people: purge anything already indexed, never index more.
+        blocked = chatdb.blocked_rows(src)
+        if blocked:
+            hm = ",".join("?" * len(blocked.handles))
+            cm = ",".join("?" * len(blocked.chat_rowids)) or "NULL"
+            idx.execute(
+                f"DELETE FROM messages_fts WHERE sender_handle IN ({hm}) OR chat_id IN ({cm})",
+                tuple(blocked.handles) + tuple(blocked.chat_rowids),
+            )
+            idx.commit()
+
         last = _last_indexed_rowid(idx)
         sql = """
             SELECT m.ROWID, m.text, m.attributedBody, m.handle_id, m.date,
@@ -90,7 +101,7 @@ def refresh_index(full_rebuild: bool = False) -> dict[str, Any]:
         """
         for row in src.execute(sql, (last,)):
             text = chatdb.message_text(row)
-            if not text:
+            if not text or blocked.drops(row["ROWID"], row["handle_id"]):
                 max_seen = max(max_seen, row["ROWID"])
                 continue
             idx.execute(
@@ -154,6 +165,9 @@ def search(
     """
     params.append(limit)
 
+    # Filter again at read time, so a stale index never leaks a blocked person.
+    with chatdb.open_db() as src:
+        blocked = chatdb.blocked_rows(src)
     with _open_index() as idx:
         return [
             {
@@ -165,6 +179,9 @@ def search(
                 "ts": r["ts"],
             }
             for r in idx.execute(sql, params)
+            if r["sender_handle"] not in blocked.handles
+            and r["chat_id"] not in blocked.chat_rowids
+            and r["rowid"] not in blocked.message_rowids
         ]
 
 
